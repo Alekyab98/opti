@@ -1,0 +1,131 @@
+-- Dynamic hourly run with late-arrival window [hour_end-3h, hour_end)
+-- No DECLARE; pure SQL, same output
+WITH
+cfg AS (
+  SELECT
+    TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR)                                  AS hour_end,
+    TIMESTAMP_SUB(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 3 HOUR)  AS hour_start
+),
+
+base_data AS (
+  SELECT
+    trans_hr                                        AS event_time,
+    fqdn,
+    -- parse/clean once
+    JSON_REMOVE(SAFE.PARSE_JSON(labels),
+      '$.__name__','$.jobid','$.job','$.localdn','$.instance',
+      '$.write_relabel_group','$.kubernetes_namespace','$.kubernetes_pod_name',
+      '$.pod_name','$.applicationId','$.icr_group'
+    )                                               AS labels_json_clean,
+    TO_JSON_STRING(JSON_REMOVE(SAFE.PARSE_JSON(labels),
+      '$.__name__','$.jobid','$.job','$.localdn','$.instance',
+      '$.write_relabel_group','$.kubernetes_namespace','$.kubernetes_pod_name',
+      '$.pod_name','$.applicationId','$.icr_group'
+    ))                                              AS labels_clean_str,
+    MD5(TO_JSON_STRING(JSON_REMOVE(SAFE.PARSE_JSON(labels),
+      '$.__name__','$.jobid','$.job','$.localdn','$.instance',
+      '$.write_relabel_group','$.kubernetes_namespace','$.kubernetes_pod_name',
+      '$.pod_name','$.applicationId','$.icr_group'
+    )))                                            AS checksum,
+    JSON_VALUE(labels,'$.instance')                 AS instance,
+    LOWER(name)                                     AS KEY,
+    SAFE_CAST(NULLIF(value,'NaN') AS FLOAT64)       AS value,
+    DATE(`timestamp`)                                AS trans_dt,
+    `timestamp`,
+    insert_date_utc
+  FROM `vz-it-pr-gudv-dtwndo-0.aid_dtwin_core_uat_tbls.oracle_cnf_scp_raw_v1_temp`, cfg
+  WHERE
+    -- 3-hour metric window
+    trans_hr >= cfg.hour_start AND trans_hr < cfg.hour_end
+    -- help partition pruning if table is partitioned by trans_dt (or add _PARTITIONDATE if used)
+    AND trans_dt BETWEEN DATE(cfg.hour_start) AND DATE(cfg.hour_end)
+    -- late-arrival gate: only rows that arrived in those 3 hours
+    AND insert_date_utc >= cfg.hour_start AND insert_date_utc < cfg.hour_end
+    AND trans_dt IS NOT NULL
+),
+
+-- Usually faster than DISTINCT on wide rows; keeps latest by insert time
+dedup AS (
+  SELECT *
+  FROM base_data
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY event_time, fqdn, labels_clean_str, instance, KEY, `timestamp`, value
+    ORDER BY insert_date_utc DESC
+  ) = 1
+),
+
+window_data AS (
+  SELECT
+    trans_dt,
+    event_time,
+    fqdn,
+    labels_json_clean,
+    labels_clean_str,
+    checksum,
+    instance,
+    KEY,
+    value,
+    `timestamp`,
+    LAG(value) OVER (
+      PARTITION BY fqdn, instance, checksum, KEY, event_time
+      ORDER BY `timestamp`
+    ) AS prev_value,
+    FIRST_VALUE(value) OVER (
+      PARTITION BY trans_dt, event_time, fqdn, instance, checksum, KEY
+      ORDER BY `timestamp` DESC
+    ) AS sum_by_value
+  FROM dedup
+),
+
+reset_adjusted AS (
+  SELECT
+    event_time,
+    fqdn,
+    instance,
+    trans_dt,
+    MAX(labels_clean_str)                     AS labels_str,
+    MAX(labels_json_clean)                    AS labels_json,
+    checksum,
+    KEY,
+    SUM(value)                                AS sum_value,
+    SUM(CASE
+          WHEN prev_value IS NULL THEN 0
+          WHEN value < prev_value THEN value
+          ELSE value - prev_value
+        END)                                  AS increase_value,
+    APPROX_QUANTILES(value, 100)[OFFSET(90)]  AS p_90,
+    MAX(sum_by_value)                         AS sum_by_value
+  FROM window_data
+  GROUP BY event_time, fqdn, instance, trans_dt, checksum, KEY
+),
+
+final_agg AS (
+  SELECT
+    event_time,
+    fqdn,
+    trans_dt,
+    ANY_VALUE(labels_json)                    AS labels_json,
+    checksum,
+    KEY,
+    SUM(increase_value)                       AS increase_value,
+    SUM(sum_value)                            AS sum_value,
+    SUM(p_90)                                 AS p_90,
+    SUM(sum_by_value)                         AS sum_by_value
+  FROM reset_adjusted
+  GROUP BY event_time, fqdn, trans_dt, checksum, KEY
+)
+
+SELECT
+  event_time                                   AS event_time,
+  'ericsson'                                   AS vendor,
+  fqdn,
+  labels_json                                  AS labels,
+  KEY                                          AS metric_name,
+  SAFE_CAST(increase_value AS BIGNUMERIC)      AS metric_increase_value,
+  SAFE_CAST(sum_value      AS BIGNUMERIC)      AS metric_sum_value,
+  SAFE_CAST(p_90           AS BIGNUMERIC)      AS metric_p_90_value,
+  SAFE_CAST(sum_by_value   AS BIGNUMERIC)      AS metric_sum_by_value,
+  trans_dt,
+  DATETIME((SELECT hour_end FROM cfg))         AS schedule_time,
+  CURRENT_TIMESTAMP                            AS updated_timestamp
+FROM final_agg, cfg;
