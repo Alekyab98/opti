@@ -5,18 +5,18 @@ WITH time_window AS (
     TIMESTAMP_SUB(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 3 HOUR) AS hour_start
 ),
 
--- Parse/clean JSON once; derive string & checksum from it (no repeats)
+/* Parse/clean JSON once; derive string & checksum from it */
 base_data AS (
   SELECT
-    TIMESTAMP_TRUNC(`timestamp`, HOUR)                           AS event_time,
+    TIMESTAMP_TRUNC(trans_hr, HOUR)                            AS event_time,     -- use the partition column
     fqdn,
     labels_json_clean,
-    TO_JSON_STRING(labels_json_clean)                            AS labels_clean_str,
-    MD5(TO_JSON_STRING(labels_json_clean))                       AS checksum,
-    JSON_VALUE(labels,'$.instance')                              AS instance,
-    LOWER(name)                                                  AS KEY,
-    SAFE_CAST(NULLIF(value,'NaN') AS FLOAT64)                    AS value,
-    DATE(`timestamp`)                                            AS trans_dt,
+    TO_JSON_STRING(labels_json_clean)                           AS labels_clean_str,
+    MD5(TO_JSON_STRING(labels_json_clean))                      AS checksum,
+    JSON_VALUE(labels,'$.instance')                             AS instance,
+    LOWER(name)                                                 AS KEY,
+    SAFE_CAST(NULLIF(value,'NaN') AS FLOAT64)                   AS value,
+    DATE(`timestamp`)                                           AS trans_dt,
     `timestamp`,
     insert_date_utc
   FROM (
@@ -27,6 +27,7 @@ base_data AS (
       value,
       `timestamp`,
       insert_date_utc,
+      trans_hr,
       JSON_REMOVE(
         SAFE.PARSE_JSON(labels),
         '$.__name__','$.jobid','$.job','$.localdn','$.instance',
@@ -35,21 +36,20 @@ base_data AS (
       ) AS labels_json_clean
     FROM `vz-it-pr-gudv-dtwndo-0.aid_dtwin_core_uat_tbls.oracle_cnf_scp_raw_v1_temp`, time_window
     WHERE
-      -- Partition pruning (use the column your table is actually partitioned on):
-      -- If partitioned by DATE(insert_date_utc), prefer this:
-      DATE(insert_date_utc) BETWEEN DATE(time_window.hour_start) AND DATE(time_window.hour_end)
-      -- If ingestion-time partitioned (_PARTITIONDATE), use this instead:
-      -- AND _PARTITIONDATE BETWEEN DATE(time_window.hour_start) AND DATE(time_window.hour_end)
+      -- ***** Partition pruning on trans_hr (your partition column) *****
+      trans_hr >= time_window.hour_start
+      AND trans_hr <  time_window.hour_end
 
-      -- Tight 3-hour metric window (you had this commented out):
-      AND `timestamp` >= time_window.hour_start
-      AND `timestamp` <  time_window.hour_end
+      -- Late-arrival gate (only rows that ARRIVED in these 3 hours)
+      AND insert_date_utc >= time_window.hour_start
+      AND insert_date_utc <  time_window.hour_end
 
+      -- Keep only rows that have a metric timestamp
       AND `timestamp` IS NOT NULL
   )
 ),
 
--- De-dup: keep the latest by insert time; DO NOT include FLOAT64 "value" in PARTITION BY
+/* De-dup: keep latest by insert time (do NOT include FLOAT64 'value' in PARTITION BY) */
 dedup AS (
   SELECT event_time, fqdn, labels_json_clean, labels_clean_str, checksum,
          instance, KEY, value, `timestamp`, insert_date_utc, trans_dt
@@ -78,8 +78,8 @@ window_data AS (
 reset_adjusted AS (
   SELECT
     event_time, fqdn, instance, trans_dt, checksum, KEY,
-    ANY_VALUE(labels_clean_str)  AS labels_str,    -- string version for safety
-    ANY_VALUE(labels_json_clean) AS labels_json,   -- JSON-safe aggregator
+    ANY_VALUE(labels_clean_str)  AS labels_str,     -- string version (for safe agg)
+    ANY_VALUE(labels_json_clean) AS labels_json,    -- JSON-safe agg
     SUM(value) AS sum_value,
     SUM(CASE
           WHEN prev_value IS NULL THEN 0
@@ -95,7 +95,7 @@ reset_adjusted AS (
 final_agg AS (
   SELECT
     event_time, fqdn, trans_dt, checksum, KEY,
-    ANY_VALUE(labels_json)  AS labels_json,  -- carry JSON object
+    ANY_VALUE(labels_json)  AS labels_json,
     SUM(increase_value)     AS increase_value,
     SUM(sum_value)          AS sum_value,
     SUM(p_90)               AS p_90,
@@ -108,7 +108,7 @@ SELECT
   event_time                                   AS event_time,
   'ericsson'                                   AS vendor,
   fqdn,
-  labels_json                                   AS labels,          -- already JSON
+  labels_json                                   AS labels,         -- JSON object
   KEY                                          AS metric_name,
   SAFE_CAST(increase_value AS BIGNUMERIC)      AS metric_increase_value,
   SAFE_CAST(sum_value      AS BIGNUMERIC)      AS metric_sum_value,
