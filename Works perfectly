@@ -1,0 +1,120 @@
+-- Dynamic hourly run with late-arrival window [hour_end-3h, hour_end)
+WITH time_window AS (
+  SELECT
+    TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR)                                 AS hour_end,
+    TIMESTAMP_SUB(TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 3 HOUR) AS hour_start
+),
+
+-- Parse/clean JSON once; derive string & checksum from it (no repeats)
+base_data AS (
+  SELECT
+    TIMESTAMP_TRUNC(`timestamp`, HOUR)                           AS event_time,
+    fqdn,
+    labels_json_clean,
+    TO_JSON_STRING(labels_json_clean)                            AS labels_clean_str,
+    MD5(TO_JSON_STRING(labels_json_clean))                       AS checksum,
+    JSON_VALUE(labels,'$.instance')                              AS instance,
+    LOWER(name)                                                  AS KEY,
+    SAFE_CAST(NULLIF(value,'NaN') AS FLOAT64)                    AS value,
+    DATE(`timestamp`)                                            AS trans_dt,
+    `timestamp`,
+    insert_date_utc
+  FROM (
+    SELECT
+      fqdn,
+      labels,
+      name,
+      value,
+      `timestamp`,
+      insert_date_utc,
+      JSON_REMOVE(
+        SAFE.PARSE_JSON(labels),
+        '$.__name__','$.jobid','$.job','$.localdn','$.instance',
+        '$.write_relabel_group','$.kubernetes_namespace','$.kubernetes_pod_name',
+        '$.pod_name','$.applicationId','$.icr_group'
+      ) AS labels_json_clean
+    FROM `vz-it-pr-gudv-dtwndo-0.aid_dtwin_core_uat_tbls.oracle_cnf_scp_raw_v1_temp`, time_window
+    WHERE
+      -- Partition pruning (use the column your table is actually partitioned on):
+      -- If partitioned by DATE(insert_date_utc), prefer this:
+      DATE(insert_date_utc) BETWEEN DATE(time_window.hour_start) AND DATE(time_window.hour_end)
+      -- If ingestion-time partitioned (_PARTITIONDATE), use this instead:
+      -- AND _PARTITIONDATE BETWEEN DATE(time_window.hour_start) AND DATE(time_window.hour_end)
+
+      -- Tight 3-hour metric window (you had this commented out):
+      AND `timestamp` >= time_window.hour_start
+      AND `timestamp` <  time_window.hour_end
+
+      AND `timestamp` IS NOT NULL
+  )
+),
+
+-- De-dup: keep the latest by insert time; DO NOT include FLOAT64 "value" in PARTITION BY
+dedup AS (
+  SELECT event_time, fqdn, labels_json_clean, labels_clean_str, checksum,
+         instance, KEY, value, `timestamp`, insert_date_utc, trans_dt
+  FROM base_data
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY event_time, fqdn, labels_clean_str, instance, KEY, `timestamp`
+    ORDER BY insert_date_utc DESC
+  ) = 1
+),
+
+window_data AS (
+  SELECT
+    trans_dt, event_time, fqdn, labels_json_clean, labels_clean_str, checksum,
+    instance, KEY, value, `timestamp`,
+    LAG(value) OVER (
+      PARTITION BY fqdn, instance, checksum, KEY, event_time
+      ORDER BY `timestamp`
+    ) AS prev_value,
+    FIRST_VALUE(value) OVER (
+      PARTITION BY trans_dt, event_time, fqdn, instance, checksum, KEY
+      ORDER BY `timestamp` DESC
+    ) AS sum_by_value
+  FROM dedup
+),
+
+reset_adjusted AS (
+  SELECT
+    event_time, fqdn, instance, trans_dt, checksum, KEY,
+    ANY_VALUE(labels_clean_str)  AS labels_str,    -- string version for safety
+    ANY_VALUE(labels_json_clean) AS labels_json,   -- JSON-safe aggregator
+    SUM(value) AS sum_value,
+    SUM(CASE
+          WHEN prev_value IS NULL THEN 0
+          WHEN value < prev_value THEN value
+          ELSE value - prev_value
+        END) AS increase_value,
+    APPROX_QUANTILES(value, 100)[OFFSET(90)] AS p_90,
+    MAX(sum_by_value) AS sum_by_value
+  FROM window_data
+  GROUP BY event_time, fqdn, instance, trans_dt, checksum, KEY
+),
+
+final_agg AS (
+  SELECT
+    event_time, fqdn, trans_dt, checksum, KEY,
+    ANY_VALUE(labels_json)  AS labels_json,  -- carry JSON object
+    SUM(increase_value)     AS increase_value,
+    SUM(sum_value)          AS sum_value,
+    SUM(p_90)               AS p_90,
+    SUM(sum_by_value)       AS sum_by_value
+  FROM reset_adjusted
+  GROUP BY event_time, fqdn, trans_dt, checksum, KEY
+)
+
+SELECT
+  event_time                                   AS event_time,
+  'ericsson'                                   AS vendor,
+  fqdn,
+  labels_json                                   AS labels,          -- already JSON
+  KEY                                          AS metric_name,
+  SAFE_CAST(increase_value AS BIGNUMERIC)      AS metric_increase_value,
+  SAFE_CAST(sum_value      AS BIGNUMERIC)      AS metric_sum_value,
+  SAFE_CAST(p_90           AS BIGNUMERIC)      AS metric_p_90_value,
+  SAFE_CAST(sum_by_value   AS BIGNUMERIC)      AS metric_sum_by_value,
+  trans_dt,
+  DATETIME((SELECT hour_end FROM time_window)) AS schedule_time,
+  CURRENT_TIMESTAMP                            AS updated_timestamp
+FROM final_agg, time_window;
